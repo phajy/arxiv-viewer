@@ -1,0 +1,29 @@
+name = "ArxivViewer"
+uuid = "4ce6c2c0-bcf0-45b3-b5c9-c949c0f45d3a"
+version = "0.1.0"
+authors = ["phajy"]
+
+[deps]
+DBInterface = "a10d1c49-ce27-4219-8d33-6db1a4562965"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+EzXML = "8f5d6c58-4d21-5cfd-889c-e3ad7ee6a615"
+Genie = "c43c736e-a2d1-11e8-161f-af95117fbd1e"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+
+[compat]
+DBInterface = "2.6.1"
+EzXML = "1.2.3"
+Genie = "5.35.14"
+HTTP = "1.11.0"
+JSON3 = "1.14.3"
+SQLite = "1.8.0"
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
