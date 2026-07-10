@@ -496,6 +496,9 @@ end
             @test occursin("Recent calendar", html)
             @test occursin(">Refresh<", html)
             @test occursin("tex-chtml.js", html)
+            @test occursin(raw"inlineMath: [['$', '$']]", html)
+            @test occursin("processHtmlClass: 'mathjax'", html)
+            @test !occursin(raw"['\(', '\)']", html)
             @test findfirst("May 2026", html) < findfirst("April 2026", html)
         finally
             if old_db_path === nothing
@@ -520,7 +523,7 @@ end
             paper = ArxivViewer.ArxivPaper(
                 "2605.30001",
                 "Black hole corona variability",
-                "We study coronal variability in an accreting black hole system with X-ray timing diagnostics.",
+                "We study coronal variability in an accreting black hole system with X-ray timing diagnostics (including low-mass ones).",
                 "2026-05-26T00:00:00",
                 "2026-05-26T00:00:00",
                 "2026-05-26",
@@ -616,6 +619,11 @@ end
             @test ArxivViewer.maybe_string(first(papers).abstract_summary) == abstract_summary
             @test ArxivViewer.maybe_string(first(papers).pdf_summary) == pdf_summary
             @test ArxivViewer.maybe_string(first(papers).local_pdf_path) == local_path
+
+            paper_card_html = ArxivViewer.render_paper_card(selection, first(papers))
+            @test occursin("paper-abstract mathjax", paper_card_html)
+            @test occursin("paper-title mathjax", paper_card_html)
+            @test occursin("(including low-mass ones)", paper_card_html)
         finally
             if old_db_path === nothing
                 delete!(ENV, "ARXIV_VIEWER_DB_PATH")
