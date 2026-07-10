@@ -82,9 +82,9 @@ function render_paper_card(selection::BrowseSelection, row)
     label_chip = isempty(current_label) ? "<span class=\"paper-label muted\">Unrated</span>" : "<span class=\"paper-label\">$(html_escape(label_display(current_label)))</span>"
     score_chip = "<span class=\"paper-score\">Score $(round(Float64(row.score); digits = 1))/10</span>"
     comment_text = maybe_value(row.comment)
-    comment_html = comment_text === nothing ? "" : "<p class=\"paper-comment\">$(html_escape(comment_text))</p>"
+    comment_html = comment_text === nothing ? "" : "<p class=\"paper-comment mathjax\">$(html_escape(comment_text))</p>"
     journal_text = maybe_value(row.journal_ref)
-    journal_html = journal_text === nothing ? "" : "<p class=\"paper-journal\">$(html_escape(journal_text))</p>"
+    journal_html = journal_text === nothing ? "" : "<p class=\"paper-journal mathjax\">$(html_escape(journal_text))</p>"
     score_detail_text = maybe_string(row.score_details)
     score_detail_html = isempty(score_detail_text) ? "" : "<p class=\"paper-score-detail\">$(html_escape(score_detail_text))</p>"
     authors_text = author_preview_text(row)
@@ -92,7 +92,7 @@ function render_paper_card(selection::BrowseSelection, row)
     pdf_summary_html = render_generated_summary("PDF summary", maybe_string(row.pdf_summary))
     authors_html = isempty(authors_text) ? "" : "<p class=\"paper-authors\">$(html_escape(authors_text))</p>"
     abstract_text = compact_whitespace(maybe_string(row.abstract))
-    abstract_html = isempty(abstract_text) ? "" : "<p class=\"paper-abstract\">$(html_escape(abstract_text))</p>"
+    abstract_html = isempty(abstract_text) ? "" : "<p class=\"paper-abstract mathjax\">$(html_escape(abstract_text))</p>"
     pdf_link = maybe_value(row.pdf_url)
     pdf_html = pdf_link === nothing ? "" : "<a class=\"paper-link\" href=\"$(html_escape(pdf_link))\" target=\"_blank\" rel=\"noreferrer\">PDF</a>"
     html_html = "<a class=\"paper-link\" href=\"$(html_escape(arxiv_html_url(paper_id)))\" target=\"_blank\" rel=\"noreferrer\">HTML</a>"
@@ -109,7 +109,7 @@ function render_paper_card(selection::BrowseSelection, row)
     return """
     <details class=\"paper-card\"$details_open>
       <summary class=\"paper-summary\">
-        <span class=\"paper-title\">$(html_escape(maybe_string(row.title)))</span>
+        <span class=\"paper-title mathjax\">$(html_escape(maybe_string(row.title)))</span>
         <span class=\"paper-summary-meta\">$score_chip$label_chip</span>
       </summary>
       <div class=\"paper-body\">
@@ -202,7 +202,7 @@ function render_calendar_month(selection::BrowseSelection, month_start::Date, co
             classes = ["calendar-day"]
             same_selection(day_target, selection) && push!(classes, "active")
             day_value == selection.reference_day && push!(classes, "latest")
-      in(day_value, viewed_days) && push!(classes, "viewed")
+            in(day_value, viewed_days) && push!(classes, "viewed")
             count = get(counts, day_value, 0)
             count_html = count > 0 ? "<span class=\"calendar-day-count\">$count</span>" : ""
             push!(
@@ -299,12 +299,14 @@ function render_layout(selection::BrowseSelection, papers, overview; notice::Uni
         <script>
           window.MathJax = {
             tex: {
-              inlineMath: [['\$', '\$'], ['\\(', '\\)']],
+              inlineMath: [['\$', '\$']],
               displayMath: [['\$\$', '\$\$'], ['\\[', '\\]']],
               processEscapes: true,
             },
             options: {
               skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+              ignoreHtmlClass: '.*',
+              processHtmlClass: 'mathjax',
             },
           };
 
@@ -314,8 +316,9 @@ function render_layout(selection::BrowseSelection, papers, overview; notice::Uni
                 return;
               }
 
-              if (window.MathJax && window.MathJax.typesetPromise) {
-                window.MathJax.typesetPromise([event.target]);
+              const mathNodes = event.target.querySelectorAll('.mathjax');
+              if (mathNodes.length && window.MathJax && window.MathJax.typesetPromise) {
+                window.MathJax.typesetPromise(Array.from(mathNodes));
               }
             }, true);
           });
