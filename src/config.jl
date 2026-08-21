@@ -22,6 +22,16 @@ server_port() = parse(Int, get(ENV, "ARXIV_VIEWER_PORT", "8000"))
 
 lookback_days() = parse(Int, get(ENV, "ARXIV_VIEWER_LOOKBACK_DAYS", "30"))
 
+arxiv_read_timeout_seconds() = parse(Int, get(ENV, "ARXIV_VIEWER_HTTP_READ_TIMEOUT", "30"))
+
+arxiv_connect_timeout_seconds() = parse(Int, get(ENV, "ARXIV_VIEWER_HTTP_CONNECT_TIMEOUT", "10"))
+
+arxiv_user_agent() = get(
+    ENV,
+    "ARXIV_VIEWER_USER_AGENT",
+    "arxiv-viewer/0.1 (+https://github.com/phajy/arxiv-viewer; local research tool)",
+)
+
 timestamp_now() = Dates.format(Dates.now(), TIMESTAMP_FMT)
 
 date_string(value::Date) = Dates.format(value, DAY_FMT)
