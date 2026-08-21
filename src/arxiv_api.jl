@@ -611,7 +611,8 @@ function fetch_listing_ids(day::Date; subject::AbstractString = "astro-ph", refe
         try
             body = fetch_list_new_body(; subject)
             listed_day = parse_list_new_listed_day(body)
-            if listed_day === nothing || listed_day == day
+            # Only trust list/new when the page date parses and matches.
+            if listed_day == day
                 return parse_catchup_ids(body)
             end
         catch err
@@ -630,7 +631,8 @@ function fetch_listing_ids(day::Date; subject::AbstractString = "astro-ph", refe
 end
 
 function fetch_catchup_papers_via_api(day::Date; subject::AbstractString = "astro-ph")
-    ids = fetch_listing_ids(day; subject)
+    # Final fallback after list/new and pastweek already failed: hit /catchup only.
+    ids = fetch_catchup_ids(day; subject)
     isempty(ids) && return ArxivPaper[]
     return fetch_arxiv_papers_by_ids(ids; first_submissions_only = false)
 end
@@ -640,7 +642,7 @@ function fetch_catchup_papers(day::Date; subject::AbstractString = "astro-ph", r
     if day >= previous_business_day(reference_day)
         try
             body = fetch_list_new_body(; subject)
-            listed_day = something(parse_list_new_listed_day(body), day)
+            listed_day = parse_list_new_listed_day(body)
             if listed_day == day
                 return parse_catchup_papers(body, day)
             end

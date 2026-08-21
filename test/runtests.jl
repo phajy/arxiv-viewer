@@ -70,6 +70,7 @@ end
     <dt><a href="/abs/2608.00003" title="Abstract" id="2608.00003">arXiv:2608.00003</a></dt>
     """
     @test ArxivViewer.parse_list_new_listed_day(list_new_html) == Date(2026, 8, 21)
+    @test ArxivViewer.parse_list_new_listed_day("<html>no listings header</html>") === nothing
     @test ArxivViewer.parse_catchup_ids(list_new_html) == ["2608.00001", "2608.00002"]
 
     pastweek_html = """
