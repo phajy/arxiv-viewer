@@ -41,7 +41,8 @@ end
 const ARXIV_REQUEST_LOCK = ReentrantLock()
 const ARXIV_NEXT_REQUEST_AT = Ref(0.0)
 const ARXIV_MIN_REQUEST_INTERVAL_SECONDS = 3.0
-const ARXIV_MAX_RETRY_ATTEMPTS = 5
+const ARXIV_MAX_RETRY_ATTEMPTS = 3
+const ARXIV_RETRYABLE_STATUS_CODES = Set((429, 502, 503, 504))
 
 function throttle_arxiv_request!()
     lock(ARXIV_REQUEST_LOCK)
@@ -56,38 +57,79 @@ function throttle_arxiv_request!()
     end
 end
 
-function arxiv_get(url::AbstractString; context::AbstractString)
+function arxiv_retry_backoff_seconds(attempt::Integer; status::Union{Nothing, Integer} = nothing)
+    # Keep total wait bounded so a bad arXiv day fails in about a minute, not several.
+    if status == 429
+        return min(10.0 * (2.0 ^ (attempt - 1)), 40.0)
+    end
+    return min(ARXIV_MIN_REQUEST_INTERVAL_SECONDS * (2.0 ^ (attempt - 1)), 24.0)
+end
+
+function is_arxiv_retryable_status(status::Integer)
+    return Int(status) in ARXIV_RETRYABLE_STATUS_CODES
+end
+
+function default_arxiv_http_get(url::AbstractString)
+    return HTTP.get(
+        String(url);
+        status_exception = false,
+        retry = false,
+        readtimeout = arxiv_read_timeout_seconds(),
+        connect_timeout = arxiv_connect_timeout_seconds(),
+        headers = ["User-Agent" => arxiv_user_agent()],
+    )
+end
+
+function arxiv_request(
+    url::AbstractString;
+    context::AbstractString,
+    http_get::Function = default_arxiv_http_get,
+    throttle!::Function = throttle_arxiv_request!,
+    backoff_seconds::Function = arxiv_retry_backoff_seconds,
+)
     attempt = 1
     request_url = String(url)
 
     while true
-        waited_seconds = throttle_arxiv_request!()
+        waited_seconds = throttle!()
         @info "arXiv request" context attempt waited_seconds request_url
-        response = HTTP.get(request_url; status_exception = false)
-        @info "arXiv response" context attempt status = response.status request_url body_bytes = length(response.body)
 
-        if response.status == 200
-            return response
-        elseif response.status == 429 && attempt < ARXIV_MAX_RETRY_ATTEMPTS
-            backoff_seconds = ARXIV_MIN_REQUEST_INTERVAL_SECONDS * (2.0 ^ (attempt - 1))
-            @warn "arXiv rate limited; retrying" context attempt status = response.status request_url backoff_seconds
-            sleep(backoff_seconds)
-            attempt += 1
-            continue
+        try
+            response = http_get(request_url)
+            @info "arXiv response" context attempt status = response.status request_url body_bytes = length(response.body)
+
+            if response.status == 200
+                return response
+            elseif is_arxiv_retryable_status(response.status) && attempt < ARXIV_MAX_RETRY_ATTEMPTS
+                delay = backoff_seconds(attempt; status = response.status)
+                @warn "arXiv transient failure; retrying" context attempt status = response.status request_url backoff_seconds = delay
+                sleep(delay)
+                attempt += 1
+                continue
+            end
+
+            error("$context failed with status $(response.status)")
+        catch err
+            err isa ErrorException && rethrow(err)
+
+            if attempt < ARXIV_MAX_RETRY_ATTEMPTS
+                delay = backoff_seconds(attempt)
+                @warn "arXiv request error; retrying" context attempt request_url backoff_seconds = delay error = sprint(showerror, err)
+                sleep(delay)
+                attempt += 1
+                continue
+            end
+
+            rethrow(err)
         end
-
-        error("$context failed with status $(response.status)")
     end
 end
 
-function arxiv_html_get(url::AbstractString; context::AbstractString)
-    request_url = String(url)
-    @info "arXiv request" context request_url
-    response = HTTP.get(request_url; status_exception = false)
-    @info "arXiv response" context status = response.status request_url body_bytes = length(response.body)
-    response.status == 200 || error("$context failed with status $(response.status)")
-    return response
-end
+arxiv_get(url::AbstractString; context::AbstractString, kwargs...) =
+    arxiv_request(url; context, kwargs...)
+
+arxiv_html_get(url::AbstractString; context::AbstractString, kwargs...) =
+    arxiv_request(url; context, kwargs...)
 
 function build_search_query(start_date::Date, end_date::Date)
     category_clause = join(["cat:$category" for category in ASTRO_PH_CATEGORIES], " OR ")
@@ -124,16 +166,98 @@ function build_id_query_url(ids::AbstractVector{<:AbstractString})
 end
 
 function build_catchup_url(subject::AbstractString, day::Date; include_abs::Bool = false)
-    return string(
-        HTTP.URI(
-            "https://arxiv.org/catchup";
-            query = [
-                "subject" => String(subject),
-                "date" => date_string(day),
-                "include_abs" => include_abs ? "True" : "False",
-            ],
-        ),
+    # Prefer the path form arXiv redirects to, avoiding an extra hop.
+    base = "https://arxiv.org/catchup/$(String(subject))/$(date_string(day))"
+    return include_abs ? "$(base)?abs=True" : base
+end
+
+build_list_new_url(subject::AbstractString = "astro-ph") = "https://arxiv.org/list/$(String(subject))/new"
+
+build_pastweek_url(subject::AbstractString = "astro-ph"; show::Integer = 2000) =
+    "https://arxiv.org/list/$(String(subject))/pastweek?skip=0&show=$(Int(show))"
+
+const LIST_NEW_DAY_FMT = dateformat"d U yyyy"
+const PASTWEEK_DAY_FMT = dateformat"d u yyyy"
+const PASTWEEK_CACHE_TTL = Minute(15)
+const pastweek_cache = Ref{Union{Nothing, NamedTuple{(:subject, :body, :expires_at), Tuple{String, String, DateTime}}}}(nothing)
+
+function parse_list_new_listed_day(body::AbstractString)
+    matched = match(r"Showing new listings for[^,]*,\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", String(body))
+    matched === nothing && return nothing
+    try
+        return Date(String(matched.captures[1]), LIST_NEW_DAY_FMT)
+    catch
+        return nothing
+    end
+end
+
+function parse_pastweek_day_sections(body::AbstractString)
+    pattern = r"<h3>([A-Za-z]+),\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})[^<]*</h3>"
+    matches = collect(eachmatch(pattern, String(body)))
+    sections = Dict{Date, String}()
+
+    for (index, matched) in enumerate(matches)
+        day = try
+            Date(String(matched.captures[2]), PASTWEEK_DAY_FMT)
+        catch
+            continue
+        end
+
+        start_index = matched.offset
+        end_index = index < length(matches) ? matches[index + 1].offset - 1 : lastindex(body)
+        sections[day] = body[start_index:end_index]
+    end
+
+    return sections
+end
+
+function fetch_list_new_body(; subject::AbstractString = "astro-ph")
+    response = arxiv_html_get(build_list_new_url(subject); context = "arXiv list/new request")
+    return String(response.body)
+end
+
+function fetch_pastweek_body(; subject::AbstractString = "astro-ph")
+    cache = pastweek_cache[]
+    if cache !== nothing && cache.subject == String(subject) && cache.expires_at >= Dates.now()
+        return cache.body
+    end
+
+    response = arxiv_html_get(build_pastweek_url(subject); context = "arXiv list/pastweek request")
+    body = String(response.body)
+    pastweek_cache[] = (
+        subject = String(subject),
+        body = body,
+        expires_at = Dates.now() + PASTWEEK_CACHE_TTL,
     )
+    return body
+end
+
+function fetch_list_new_listed_day(; subject::AbstractString = "astro-ph")
+    return parse_list_new_listed_day(fetch_list_new_body(; subject))
+end
+
+function fetch_list_new_ids(; subject::AbstractString = "astro-ph")
+    return parse_catchup_ids(fetch_list_new_body(; subject))
+end
+
+function fetch_list_new_papers(; subject::AbstractString = "astro-ph")
+    body = fetch_list_new_body(; subject)
+    listed_day = something(parse_list_new_listed_day(body), Dates.today())
+    return parse_catchup_papers(body, listed_day)
+end
+
+function fetch_pastweek_ids(day::Date; subject::AbstractString = "astro-ph")
+    sections = parse_pastweek_day_sections(fetch_pastweek_body(; subject))
+    section = get(sections, day, nothing)
+    section === nothing && return nothing
+    return extract_catchup_ids(section)
+end
+
+function fetch_pastweek_papers_via_api(day::Date; subject::AbstractString = "astro-ph")
+    ids = fetch_pastweek_ids(day; subject)
+    ids === nothing && return nothing
+    isempty(ids) && return ArxivPaper[]
+    return fetch_arxiv_papers_by_ids(ids; first_submissions_only = false)
 end
 
 function class_xpath(class_name::AbstractString)
@@ -249,13 +373,13 @@ function parse_entry(entry)
     )
 end
 
-function parse_feed(body::AbstractString)
+function parse_feed(body::AbstractString; first_submissions_only::Bool = true)
     document = EzXML.parsexml(String(body))
     papers = ArxivPaper[]
     for entry in xpath_findall("/*[local-name()='feed']/*[local-name()='entry']", document)
         paper = parse_entry(entry)
         paper === nothing && continue
-        is_first_submission(paper) || continue
+        first_submissions_only && !is_first_submission(paper) && continue
         push!(papers, paper)
     end
 
@@ -286,7 +410,11 @@ function fetch_arxiv_papers(start_date::Date, end_date::Date; max_results::Integ
     return sort!(collect(values(papers)); by = paper -> (paper.submitted_on, lowercase(paper.title)), rev = true)
 end
 
-function fetch_arxiv_papers_by_ids(ids::AbstractVector{<:AbstractString}; batch_size::Integer = 50)
+function fetch_arxiv_papers_by_ids(
+    ids::AbstractVector{<:AbstractString};
+    batch_size::Integer = 50,
+    first_submissions_only::Bool = true,
+)
     isempty(ids) && return ArxivPaper[]
 
     papers = Dict{String, ArxivPaper}()
@@ -298,7 +426,7 @@ function fetch_arxiv_papers_by_ids(ids::AbstractVector{<:AbstractString}; batch_
         batch_ids = unique_ids[start_index:end_index]
         response = arxiv_get(build_id_query_url(batch_ids); context = "arXiv API request")
 
-        for paper in parse_feed(String(response.body))
+        for paper in parse_feed(String(response.body); first_submissions_only)
             papers[paper.arxiv_id] = paper
         end
 
@@ -344,11 +472,12 @@ function catchup_sections(body::AbstractString)
         nothing
     end
 
-    new_following = ["<h3>Replacements"]
+    replacement_headings = ["<h3>Replacement submissions", "<h3>Replacements"]
+    new_following = copy(replacement_headings)
     cross_heading === nothing || pushfirst!(new_following, cross_heading)
 
     new_section = catchup_section(body, "<h3>New submissions", new_following)
-    cross_section = cross_heading === nothing ? "" : catchup_section(body, cross_heading, ["<h3>Replacements"])
+    cross_section = cross_heading === nothing ? "" : catchup_section(body, cross_heading, replacement_headings)
 
     return (; new_section, cross_section)
 end
@@ -475,12 +604,71 @@ function fetch_catchup_ids(day::Date; subject::AbstractString = "astro-ph")
     return parse_catchup_ids(String(response.body))
 end
 
-function fetch_catchup_papers(day::Date; subject::AbstractString = "astro-ph")
-    response = arxiv_html_get(
-        build_catchup_url(subject, day; include_abs = true);
-        context = "arXiv catch-up listing request",
-    )
-    return parse_catchup_papers(String(response.body), day)
+function fetch_listing_ids(day::Date; subject::AbstractString = "astro-ph", reference_day::Date = Dates.today())
+    # Prefer list/new for the live mailing, then pastweek for other recent days.
+    # /catchup is currently unreliable (timeouts/503), so keep it last.
+    if day >= previous_business_day(reference_day)
+        try
+            body = fetch_list_new_body(; subject)
+            listed_day = parse_list_new_listed_day(body)
+            # Only trust list/new when the page date parses and matches.
+            if listed_day == day
+                return parse_catchup_ids(body)
+            end
+        catch err
+            @warn "list/new ID fetch failed; trying pastweek" day subject error = sprint(showerror, err)
+        end
+    end
+
+    try
+        ids = fetch_pastweek_ids(day; subject)
+        ids !== nothing && return ids
+    catch err
+        @warn "pastweek ID fetch failed; trying catch-up" day subject error = sprint(showerror, err)
+    end
+
+    return fetch_catchup_ids(day; subject)
+end
+
+function fetch_catchup_papers_via_api(day::Date; subject::AbstractString = "astro-ph")
+    # Final fallback after list/new and pastweek already failed: hit /catchup only.
+    ids = fetch_catchup_ids(day; subject)
+    isempty(ids) && return ArxivPaper[]
+    return fetch_arxiv_papers_by_ids(ids; first_submissions_only = false)
+end
+
+function fetch_catchup_papers(day::Date; subject::AbstractString = "astro-ph", reference_day::Date = Dates.today())
+    # Current mailing: list/new includes abstracts and is fast/reliable.
+    if day >= previous_business_day(reference_day)
+        try
+            body = fetch_list_new_body(; subject)
+            listed_day = parse_list_new_listed_day(body)
+            if listed_day == day
+                return parse_catchup_papers(body, day)
+            end
+        catch err
+            @warn "list/new listing failed; trying pastweek/API" day subject error = sprint(showerror, err)
+        end
+    end
+
+    # Recent historical days: pastweek IDs + Atom API abstracts.
+    try
+        papers = fetch_pastweek_papers_via_api(day; subject)
+        papers !== nothing && return papers
+    catch err
+        @warn "pastweek listing failed; falling back to catch-up" day subject error = sprint(showerror, err)
+    end
+
+    try
+        return fetch_catchup_papers_via_api(day; subject)
+    catch err
+        @warn "Catch-up IDs + API failed; falling back to abs HTML listing" day subject error = sprint(showerror, err)
+        response = arxiv_html_get(
+            build_catchup_url(subject, day; include_abs = true);
+            context = "arXiv catch-up listing request",
+        )
+        return parse_catchup_papers(String(response.body), day)
+    end
 end
 
 previous_business_day(day::Date) = begin
@@ -494,21 +682,52 @@ end
 const LATEST_LISTED_DAY_CACHE_TTL = Minute(15)
 const latest_listed_day_cache = Ref{Union{Nothing, NamedTuple{(:reference_day, :resolved_day, :expires_at), Tuple{Date, Date, DateTime}}}}(nothing)
 
-function latest_listed_day_uncached(; reference_day::Date = Dates.today(), fetch_ids::Function = fetch_catchup_ids, max_lookback::Integer = 5)
+function fallback_listed_day(reference_day::Date)
+    local_day = try
+        latest_appearance_day()
+    catch
+        nothing
+    end
+
     candidate = dayofweek(reference_day) > 5 ? previous_business_day(reference_day) : reference_day
-    fallback_day = candidate
+    local_day === nothing && return candidate
+    return min(local_day, candidate)
+end
+
+function latest_listed_day_uncached(; reference_day::Date = Dates.today(), fetch_ids::Function = fetch_listing_ids, max_lookback::Integer = 5)
+    fallback_day = fallback_listed_day(reference_day)
+
+    if fetch_ids === fetch_listing_ids || fetch_ids === fetch_catchup_ids
+        try
+            listed_day = fetch_list_new_listed_day()
+            if listed_day !== nothing && listed_day <= reference_day
+                return listed_day
+            end
+        catch err
+            @warn "Could not resolve latest listed day from list/new; using local/calendar fallback" error = sprint(showerror, err)
+            return fallback_day
+        end
+    end
+
+    candidate = dayofweek(reference_day) > 5 ? previous_business_day(reference_day) : reference_day
 
     for _ in 0:max(max_lookback, 0)
-        ids = fetch_ids(candidate)
-        !isempty(ids) && return candidate
+        try
+            ids = fetch_ids(candidate)
+            !isempty(ids) && return candidate
+        catch err
+            @warn "Listed-day probe failed; using fallback" day = candidate error = sprint(showerror, err)
+            return fallback_day
+        end
         candidate = previous_business_day(candidate)
     end
 
     return fallback_day
 end
 
-function latest_listed_day(; reference_day::Date = Dates.today(), fetch_ids::Function = fetch_catchup_ids, max_lookback::Integer = 5)
-    if fetch_ids === fetch_catchup_ids
+function latest_listed_day(; reference_day::Date = Dates.today(), fetch_ids::Function = fetch_listing_ids, max_lookback::Integer = 5)
+    use_cache = fetch_ids === fetch_listing_ids || fetch_ids === fetch_catchup_ids
+    if use_cache
         cache = latest_listed_day_cache[]
         if cache !== nothing && cache.reference_day == reference_day && cache.expires_at >= Dates.now()
             return cache.resolved_day
@@ -517,7 +736,7 @@ function latest_listed_day(; reference_day::Date = Dates.today(), fetch_ids::Fun
 
     resolved_day = latest_listed_day_uncached(; reference_day, fetch_ids, max_lookback)
 
-    if fetch_ids === fetch_catchup_ids
+    if use_cache
         latest_listed_day_cache[] = (
             reference_day = reference_day,
             resolved_day = resolved_day,
@@ -528,7 +747,7 @@ function latest_listed_day(; reference_day::Date = Dates.today(), fetch_ids::Fun
     return resolved_day
 end
 
-function default_window_selection(window::AbstractString; reference_day::Date = Dates.today(), fetch_ids::Function = fetch_catchup_ids)
+function default_window_selection(window::AbstractString; reference_day::Date = Dates.today(), fetch_ids::Function = fetch_listing_ids)
     resolved_reference_day = latest_listed_day(; reference_day, fetch_ids)
     return window_selection(window; reference_day = resolved_reference_day)
 end

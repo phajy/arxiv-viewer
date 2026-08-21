@@ -52,6 +52,101 @@ end
     @test today_selection.upper == Date(2026, 5, 29)
 end
 
+@testset "Catch-up URL and retryable fetches" begin
+    @test ArxivViewer.build_catchup_url("astro-ph", Date(2026, 8, 21)) ==
+        "https://arxiv.org/catchup/astro-ph/2026-08-21"
+    @test ArxivViewer.build_catchup_url("astro-ph", Date(2026, 8, 21); include_abs = true) ==
+        "https://arxiv.org/catchup/astro-ph/2026-08-21?abs=True"
+    @test ArxivViewer.build_list_new_url("astro-ph") == "https://arxiv.org/list/astro-ph/new"
+    @test occursin("/list/astro-ph/pastweek", ArxivViewer.build_pastweek_url("astro-ph"))
+
+    list_new_html = """
+    <h3>Showing new listings for Friday, 21 August 2026</h3>
+    <h3>New submissions (showing 1 of 1 entries)</h3>
+    <dt><a href="/abs/2608.00001" title="Abstract" id="2608.00001">arXiv:2608.00001</a></dt>
+    <h3>Cross submissions (showing 1 of 1 entries)</h3>
+    <dt><a href="/abs/2608.00002" title="Abstract" id="2608.00002">arXiv:2608.00002</a></dt>
+    <h3>Replacement submissions (showing 1 of 1 entries)</h3>
+    <dt><a href="/abs/2608.00003" title="Abstract" id="2608.00003">arXiv:2608.00003</a></dt>
+    """
+    @test ArxivViewer.parse_list_new_listed_day(list_new_html) == Date(2026, 8, 21)
+    @test ArxivViewer.parse_list_new_listed_day("<html>no listings header</html>") === nothing
+    @test ArxivViewer.parse_catchup_ids(list_new_html) == ["2608.00001", "2608.00002"]
+
+    pastweek_html = """
+    <h3>Fri, 21 Aug 2026 (showing 1 of 1 entries )</h3>
+    <dt><a href="/abs/2608.10001" title="Abstract" id="2608.10001">arXiv:2608.10001</a></dt>
+    <h3>Wed, 19 Aug 2026 (showing 2 of 2 entries )</h3>
+    <dt><a href="/abs/2608.18051" title="Abstract" id="2608.18051">arXiv:2608.18051</a></dt>
+    <dt><a href="/abs/2608.18000" title="Abstract" id="2608.18000">arXiv:2608.18000</a></dt>
+    <h3>Tue, 18 Aug 2026 (showing 1 of 1 entries )</h3>
+    <dt><a href="/abs/2608.17001" title="Abstract" id="2608.17001">arXiv:2608.17001</a></dt>
+    """
+    pastweek_sections = ArxivViewer.parse_pastweek_day_sections(pastweek_html)
+    @test sort!(collect(keys(pastweek_sections))) == [Date(2026, 8, 18), Date(2026, 8, 19), Date(2026, 8, 21)]
+    @test ArxivViewer.extract_catchup_ids(pastweek_sections[Date(2026, 8, 19)]) == ["2608.18051", "2608.18000"]
+    @test !haskey(pastweek_sections, Date(2026, 8, 20))
+
+    @test ArxivViewer.is_arxiv_retryable_status(429)
+    @test ArxivViewer.is_arxiv_retryable_status(503)
+    @test !ArxivViewer.is_arxiv_retryable_status(404)
+
+    attempts = Ref(0)
+    response = ArxivViewer.arxiv_html_get(
+        "https://arxiv.org/catchup/astro-ph/2026-08-21?abs=True";
+        context = "test catch-up",
+        throttle! = () -> 0.0,
+        backoff_seconds = (attempt; status = nothing) -> 0.0,
+        http_get = url -> begin
+            attempts[] += 1
+            @test occursin("2026-08-21", url)
+            if attempts[] == 1
+                return (; status = 503, body = Vector{UInt8}(codeunits("unavailable")))
+            end
+            return (; status = 200, body = Vector{UInt8}(codeunits("<html>ok</html>")))
+        end,
+    )
+    @test attempts[] == 2
+    @test String(response.body) == "<html>ok</html>"
+
+    permanent_attempts = Ref(0)
+    @test_throws ErrorException ArxivViewer.arxiv_html_get(
+        "https://arxiv.org/catchup/astro-ph/2026-08-21";
+        context = "test catch-up permanent",
+        throttle! = () -> 0.0,
+        backoff_seconds = (attempt; status = nothing) -> 0.0,
+        http_get = _ -> begin
+            permanent_attempts[] += 1
+            return (; status = 404, body = Vector{UInt8}(codeunits("missing")))
+        end,
+    )
+    @test permanent_attempts[] == 1
+
+    @test ArxivViewer.arxiv_retry_backoff_seconds(1; status = 429) == 10.0
+    @test ArxivViewer.arxiv_retry_backoff_seconds(3; status = 429) == 40.0
+    @test ArxivViewer.arxiv_retry_backoff_seconds(1) == 3.0
+
+    # Network failures while resolving "today" must not raise; fall back locally.
+    mktempdir() do tempdir
+        old_db_path = get(ENV, "ARXIV_VIEWER_DB_PATH", nothing)
+        try
+            ENV["ARXIV_VIEWER_DB_PATH"] = joinpath(tempdir, "test.sqlite")
+            ArxivViewer.init_database!()
+            ArxivViewer.latest_listed_day_cache[] = nothing
+            @test ArxivViewer.latest_listed_day(
+                reference_day = Date(2026, 8, 21),
+                fetch_ids = _ -> error("network down"),
+            ) == Date(2026, 8, 21)
+        finally
+            if old_db_path === nothing
+                delete!(ENV, "ARXIV_VIEWER_DB_PATH")
+            else
+                ENV["ARXIV_VIEWER_DB_PATH"] = old_db_path
+            end
+        end
+    end
+end
+
 @testset "Vote ordering" begin
     mktempdir() do tempdir
         old_db_path = get(ENV, "ARXIV_VIEWER_DB_PATH", nothing)
